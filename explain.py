@@ -13,10 +13,13 @@ from __future__ import annotations
 import json
 import os
 import urllib.request
+from typing import Optional
 
 
 class Explainer:
-    def explain(self, product: dict, score_result: dict) -> str:
+    name = "base"
+
+    def explain(self, product: dict, score_result: dict, risks: list) -> str:
         raise NotImplementedError
 
 
@@ -24,12 +27,18 @@ class TemplateExplainer(Explainer):
     """No-model fallback. Renders the factor breakdown as sentences.
     Honestly decent — the breakdown already carries the content."""
 
-    def explain(self, product: dict, score_result: dict) -> str:
+    name = "template"
+
+    def explain(self, product: dict, score_result: dict, risks: list) -> str:
         name = product.get("name", "this product")
         score = score_result["score"]
         band = score_result["band"]
-        factors = [f for f in score_result["factors"] if f["points"] != 0]
+        if score is None:
+            return (f"{name} has no sugar, saturated fat or salt data in Open Food "
+                    "Facts, so any score would be made up. Check the label — and if "
+                    "you're feeling generous, add the numbers on openfoodfacts.org.")
 
+        factors = [f for f in score_result["factors"] if f["points"] != 0]
         negs = sorted([f for f in factors if f["points"] < 0],
                       key=lambda f: f["points"])
         poss = sorted([f for f in factors if f["points"] > 0],
@@ -45,13 +54,16 @@ class TemplateExplainer(Explainer):
                 bits.append(f"Also dragging it down: {f['label'].lower()} "
                             f"({f['points']:+g}) — {f['detail']}.")
         if poss:
-            p = poss[0]
-            bits.append(f"On the plus side: {p['detail']}.")
+            bits.append(f"On the plus side: {poss[0]['detail']}.")
         if not negs and not poss:
-            bits.append("Not enough nutrition data reported to say much — "
-                        "crowdsourced databases are patchy like that.")
-        missing = [f for f in score_result["factors"]
-                   if f["label"] == "Missing data"]
+            bits.append("Nothing in the nutrition data raises a flag.")
+
+        high = [r for r in risks if r["level"] == "high"]
+        if high:
+            r = high[0]
+            bits.append(f"Worth knowing about {r['name']}: {r['reason']}")
+
+        missing = [f for f in score_result["factors"] if f["label"] == "Missing data"]
         if missing:
             bits.append("One caveat: " + missing[0]["detail"] + ".")
         return " ".join(bits)
@@ -61,25 +73,31 @@ class LLMExplainer(Explainer):
     """Calls any OpenAI-compatible chat endpoint. Bring your own key —
     the demo runs fine without this."""
 
-    def __init__(self, base_url: str | None = None, api_key: str | None = None,
-                 model: str | None = None):
+    name = "llm"
+
+    def __init__(self, base_url: Optional[str] = None, api_key: Optional[str] = None,
+                 model: Optional[str] = None):
         self.base_url = (base_url or os.environ.get("LLM_API_BASE", "")).rstrip("/")
         self.api_key = api_key or os.environ.get("LLM_API_KEY", "")
         self.model = model or os.environ.get("LLM_MODEL", "gpt-4o-mini")
         if not self.base_url or not self.api_key:
             raise ValueError("LLM_API_BASE and LLM_API_KEY must be set")
 
-    def explain(self, product: dict, score_result: dict) -> str:
+    def explain(self, product: dict, score_result: dict, risks: list) -> str:
+        score = score_result["score"]
         prompt = (
             "You are explaining a packaged-food health score to a shopper. "
             "Be conversational and specific; cite the numbers given. Do not "
             "invent nutrition facts beyond what's provided. Keep it under 120 words.\n\n"
             f"Product: {product.get('name')} "
             f"({', '.join(product.get('brands', []))})\n"
-            f"Score: {score_result['score']}/100 ({score_result['band']})\n"
+            f"Score: {score if score is not None else 'n/a'}/100 ({score_result['band']})\n"
             "Factor breakdown:\n"
             + "\n".join(f"- {f['label']}: {f['points']:+g} pts — {f['detail']}"
                         for f in score_result["factors"])
+            + "\nFlagged ingredients:\n"
+            + ("\n".join(f"- {r['name']} ({r['level']} risk): {r['reason']}"
+                         for r in risks) or "- none")
         )
         body = json.dumps({
             "model": self.model,
@@ -102,3 +120,25 @@ def default_explainer() -> Explainer:
         return LLMExplainer()
     except ValueError:
         return TemplateExplainer()
+
+
+def explain(product: dict, score_result: dict, risks: list) -> tuple:
+    """(text, explainer name). An LLM hiccup must never break the result
+    screen, so any failure falls back to the template."""
+    explainer = default_explainer()
+    try:
+        return explainer.explain(product, score_result, risks), explainer.name
+    except Exception:
+        fallback = TemplateExplainer()
+        return fallback.explain(product, score_result, risks), fallback.name
+
+
+def explain(product: dict, score_result: dict, risks: list) -> tuple:
+    """(text, explainer name). An LLM hiccup must never break the result
+    screen, so any failure falls back to the template."""
+    explainer = default_explainer()
+    try:
+        return explainer.explain(product, score_result, risks), explainer.name
+    except Exception:
+        fallback = TemplateExplainer()
+        return fallback.explain(product, score_result, risks), fallback.name
